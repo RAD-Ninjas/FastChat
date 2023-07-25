@@ -4,6 +4,9 @@ A model worker that executes the model based on vLLM.
 See documentations at docs/vllm_integration.md
 """
 
+import sys
+sys.path.insert(0,"/home/openvino/FastChat")
+
 import argparse
 import asyncio
 import json
@@ -30,6 +33,23 @@ from optimum.intel.openvino import OVModelForCausalLM
 app = FastAPI()
 
 TOKEN = os.environ['HF_TOKEN']
+DEFAULT_SYSTEM_PROMPT = """\
+You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe.  Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature.
+
+If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.\
+"""
+
+
+def build_inputs(history: list[tuple[str, str]],
+                 query: str,
+                 system_prompt=DEFAULT_SYSTEM_PROMPT) -> str:
+    texts = [f'[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n']
+    for user_input, response in history:
+        texts.append(
+            f'{user_input.strip()} [/INST] {response.strip()} </s><s> [INST] ')
+    texts.append(f'{query.strip()} [/INST]')
+    return ''.join(texts)
+
 
 class LlamaModel():
 
@@ -74,112 +94,6 @@ class LlamaModel():
         return model_output
 
 
-_SAMPLING_EPS = 1e-5
-
-
-class SamplingParams:
-    def __init__(
-        self,
-        n: int = 1,
-        best_of: Optional[int] = None,
-        presence_penalty: float = 0.0,
-        frequency_penalty: float = 0.0,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = -1,
-        use_beam_search: bool = False,
-        stop: Union[None, str, List[str]] = None,
-        ignore_eos: bool = False,
-        max_tokens: int = 16,
-        logprobs: Optional[int] = None,
-    ) -> None:
-        self.n = n
-        self.best_of = best_of if best_of is not None else n
-        self.presence_penalty = presence_penalty
-        self.frequency_penalty = frequency_penalty
-        self.temperature = temperature
-        self.top_p = top_p
-        self.top_k = top_k
-        self.use_beam_search = use_beam_search
-        if stop is None:
-            self.stop = []
-        elif isinstance(stop, str):
-            self.stop = [stop]
-        else:
-            self.stop = list(stop)
-        self.ignore_eos = ignore_eos
-        self.max_tokens = max_tokens
-        self.logprobs = logprobs
-
-        self._verify_args()
-        if self.use_beam_search:
-            self._verity_beam_search()
-        elif self.temperature < _SAMPLING_EPS:
-            # Zero temperature means greedy sampling.
-            self._verify_greedy_sampling()
-
-    def _verify_args(self) -> None:
-        if self.n < 1:
-            raise ValueError(f"n must be at least 1, got {self.n}.")
-        if self.best_of < self.n:
-            raise ValueError(f"best_of must be greater than or equal to n, "
-                             f"got n={self.n} and best_of={self.best_of}.")
-        if not -2.0 <= self.presence_penalty <= 2.0:
-            raise ValueError("presence_penalty must be in [-2, 2], got "
-                             f"{self.presence_penalty}.")
-        if not -2.0 <= self.frequency_penalty <= 2.0:
-            raise ValueError("frequency_penalty must be in [-2, 2], got "
-                             f"{self.frequency_penalty}.")
-        if self.temperature < 0.0:
-            raise ValueError(
-                f"temperature must be non-negative, got {self.temperature}.")
-        if not 0.0 < self.top_p <= 1.0:
-            raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
-        if self.top_k < -1 or self.top_k == 0:
-            raise ValueError(f"top_k must be -1 (disable), or at least 1, "
-                             f"got {self.top_k}.")
-        if self.max_tokens < 1:
-            raise ValueError(
-                f"max_tokens must be at least 1, got {self.max_tokens}.")
-        if self.logprobs is not None and self.logprobs < 0:
-            raise ValueError(
-                f"logprobs must be non-negative, got {self.logprobs}.")
-
-    def _verity_beam_search(self) -> None:
-        if self.best_of == 1:
-            raise ValueError("best_of must be greater than 1 when using beam "
-                             f"search. Got {self.best_of}.")
-        if self.temperature > _SAMPLING_EPS:
-            raise ValueError("temperature must be 0 when using beam search.")
-        if self.top_p < 1.0 - _SAMPLING_EPS:
-            raise ValueError("top_p must be 1 when using beam search.")
-        if self.top_k != -1:
-            raise ValueError("top_k must be -1 when using beam search.")
-
-    def _verify_greedy_sampling(self) -> None:
-        if self.best_of > 1:
-            raise ValueError("best_of must be 1 when using greedy sampling."
-                             f"Got {self.best_of}.")
-        if self.top_p < 1.0 - _SAMPLING_EPS:
-            raise ValueError("top_p must be 1 when using greedy sampling.")
-        if self.top_k != -1:
-            raise ValueError("top_k must be -1 when using greedy sampling.")
-
-    def __repr__(self) -> str:
-        return (f"SamplingParams(n={self.n}, "
-                f"best_of={self.best_of}, "
-                f"presence_penalty={self.presence_penalty}, "
-                f"frequency_penalty={self.frequency_penalty}, "
-                f"temperature={self.temperature}, "
-                f"top_p={self.top_p}, "
-                f"top_k={self.top_k}, "
-                f"use_beam_search={self.use_beam_search}, "
-                f"stop={self.stop}, "
-                f"ignore_eos={self.ignore_eos}, "
-                f"max_tokens={self.max_tokens}, "
-                f"logprobs={self.logprobs})")
-
-
 class OpenvinoWorker(BaseModelWorker):
     def __init__(
         self,
@@ -190,6 +104,7 @@ class OpenvinoWorker(BaseModelWorker):
         model_names: List[str],
         limit_worker_concurrency: int,
         no_register: bool,
+        ov_model: LlamaModel
     ):
         super().__init__(
             controller_addr,
@@ -236,19 +151,9 @@ class OpenvinoWorker(BaseModelWorker):
         top_p = max(top_p, 1e-5)
         if temperature <= 1e-5:
             top_p = 1.0
-        sampling_params = SamplingParams(
-            n=1,
-            temperature=temperature,
-            top_p=top_p,
-            use_beam_search=False,
-            stop=stop,
-            max_tokens=max_new_tokens,
-        )
 
-        outputs = ["this is the only output"]
-
-        for output in outputs:
-            yield output
+        for output in ov_model.generate_iterate(build_inputs([("Hello","Hi!, How can I help you?")],context), max_new_tokens, 20, top_p, temperature):
+            yield {"text": output, "error_code": 0, "usage": {}}
 
         # results_generator = engine.generate(context, sampling_params, request_id)
 
@@ -266,9 +171,10 @@ class OpenvinoWorker(BaseModelWorker):
         #     yield (json.dumps(ret) + "\0").encode()
 
     async def generate(self, params):
+        return {"text":"Fixed response", "error_code": 0, "usage": {}}
         async for x in self.generate_stream(params):
-            pass
-        return json.loads(x[:-1].decode())
+            print(x)
+        return x
 
 
 def release_worker_semaphore():
@@ -312,7 +218,6 @@ async def api_generate(request: Request):
     params["request_id"] = request_id
     output = await worker.generate(params)
     release_worker_semaphore()
-    await engine.abort(request_id)
     return JSONResponse(output)
 
 
@@ -345,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--controller-address", type=str, default="http://localhost:21001"
     )
-    parser.add_argument("--model-path", type=str, default="/models/llama-2/ir_model")
+    parser.add_argument("--model-path", type=str, default="/home/openvino/models/llama-2/ir_model")
     parser.add_argument(
         "--model-names",
         type=lambda s: s.split(","),
@@ -353,13 +258,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--limit-worker-concurrency", type=int, default=1024)
     parser.add_argument("--no-register", action="store_true")
-    parser.add_argument("--num-gpus", type=int, default=1)
 
     args = parser.parse_args()
     args.model = "meta-llama/Llama-2-7b-chat-hf"
 
+    print("*"*8+"LOADING MODEL... (this may take a while)"+"*"*8)
     ov_model = LlamaModel(args.model, model_path=args.model_path,
                               token=os.environ.get("HF_TOKEN", ""))
+    print("*"*8+"MODEL LOADED!"+"*"*8)
     worker = OpenvinoWorker(
         args.controller_address,
         args.worker_address,
