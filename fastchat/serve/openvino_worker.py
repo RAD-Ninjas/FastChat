@@ -32,7 +32,6 @@ from fastchat.utils import get_context_length
 from transformers import LlamaTokenizer, TextIteratorStreamer
 from optimum.intel.openvino import OVModelForCausalLM
 
-
 app = FastAPI()
 
 TOKEN = os.environ['HF_TOKEN']
@@ -50,7 +49,7 @@ def build_inputs(history: list[tuple[str, str]],
     for user_input, response in history:
         texts.append(
             f'{user_input.strip()} [/INST] {response.strip()} </s><s> [INST] ')
-    texts.append(f'{query.strip()} [/INST]')
+    texts.append(f'{query.strip()}')
     return ''.join(texts)
 
 
@@ -58,7 +57,7 @@ class LlamaModel():
 
     def __init__(self,
                  tokenizer_path,
-                 device='CPU',
+                 device='GPU.1',
                  model_path='../ir_model_chat',
                  token=TOKEN) -> None:
         self.tokenizer = LlamaTokenizer.from_pretrained(tokenizer_path,
@@ -66,7 +65,11 @@ class LlamaModel():
                                                         token=TOKEN)
         self.ov_model = OVModelForCausalLM.from_pretrained(model_path,
                                                            token=TOKEN,
-                                                           device=device)
+                                                           compile=False,
+                                                           use_cache=True)
+        print(device)
+        self.ov_model.to(device)
+        self.ov_model.compile()
 
     def generate_iterate(self, queue, prompt: str, max_generated_tokens, top_k, top_p,
                          temperature):
@@ -87,10 +90,14 @@ class LlamaModel():
                                top_k=top_k,
                                eos_token_id=self.tokenizer.eos_token_id)
 
-        self.ov_model.generate(**generate_kwargs)
+        print("Starting inference now...")
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(self.ov_model.generate,**generate_kwargs)
+        print("Producing streaming outputs...")
         # Pull the generated text from the streamer, and update the model output.
         model_output = ""
         for new_text in streamer:
+            print(f"Token: {new_text}")
             model_output += new_text
             queue.put_nowait(model_output)
         queue.put_nowait(None)
@@ -125,13 +132,13 @@ class OpenvinoWorker(BaseModelWorker):
             self.init_heart_beat()
 
     async def consumer(self, queue):
+        print("Started consumer")
         while True:
-            print("started consumer")
             value = await queue.get()
-            print("consumed")
             if value is None:
                 break
             yield value
+        print("Done.")
 
     async def generate_stream(self, params):
         self.call_ct += 1
@@ -162,9 +169,11 @@ class OpenvinoWorker(BaseModelWorker):
             top_p = 1.0
 
         queue = asyncio.Queue()
-        inputs = build_inputs([("Hello", "Hi!, How can I help you?")], context)
-        loop = asyncio.get_running_loop()
-        loop.run_in_executor(None,ov_model.generate_iterate, queue, inputs,max_new_tokens, 20, top_p, temperature)
+        print(f"CONTEXT: {context}")
+        inputs = build_inputs([], context[60:]) # Remove useless prefix
+        print(f"INPUTS: {inputs}")
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(ov_model.generate_iterate, queue, inputs,max_new_tokens, 20, top_p, temperature)
 
         async for output in self.consumer(queue):
             yield {"text": output, "error_code": 0, "usage": {}}
@@ -261,8 +270,10 @@ if __name__ == "__main__":
     args.model = "meta-llama/Llama-2-7b-chat-hf"
 
     print("*"*8+"LOADING MODEL... (this may take a while)"+"*"*8)
-    ov_model = LlamaModel(args.model, model_path=args.model_path,
-                              token=os.environ.get("HF_TOKEN", ""), device=args.device)
+    ov_model = LlamaModel(args.model,
+                          model_path=args.model_path,
+                          token=os.environ.get("HF_TOKEN", ""),
+                          device=args.device)
     print("*"*8+"MODEL LOADED!"+"*"*8)
     executor = ThreadPoolExecutor(max_workers=1)
     worker = OpenvinoWorker(
