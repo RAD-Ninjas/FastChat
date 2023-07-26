@@ -244,6 +244,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=21002)
     parser.add_argument("--worker-address", type=str, default="http://localhost:21002")
+    parser.add_argument("--device", type=str, default="CPU")
     parser.add_argument(
         "--controller-address", type=str, default="http://localhost:21001"
     )
@@ -261,7 +262,7 @@ if __name__ == "__main__":
 
     print("*"*8+"LOADING MODEL... (this may take a while)"+"*"*8)
     ov_model = LlamaModel(args.model, model_path=args.model_path,
-                              token=os.environ.get("HF_TOKEN", ""))
+                              token=os.environ.get("HF_TOKEN", ""), device=args.device)
     print("*"*8+"MODEL LOADED!"+"*"*8)
     executor = ThreadPoolExecutor(max_workers=1)
     worker = OpenvinoWorker(
