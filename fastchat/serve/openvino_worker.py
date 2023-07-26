@@ -169,11 +169,8 @@ class OpenvinoWorker(BaseModelWorker):
             top_p = 1.0
 
         queue = asyncio.Queue()
-        print(f"CONTEXT: {context}")
-        inputs = build_inputs([], context[60:]) # Remove useless prefix
-        print(f"INPUTS: {inputs}")
         executor = ThreadPoolExecutor(max_workers=1)
-        executor.submit(ov_model.generate_iterate, queue, inputs,max_new_tokens, 20, top_p, temperature)
+        executor.submit(ov_model.generate_iterate, queue, context,max_new_tokens, 20, top_p, temperature)
 
         async for output in self.consumer(queue):
             yield {"text": output, "error_code": 0, "usage": {}}
