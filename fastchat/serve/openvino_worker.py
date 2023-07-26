@@ -5,6 +5,9 @@ See documentations at docs/vllm_integration.md
 """
 
 import sys
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+
 sys.path.insert(0,"/home/openvino/FastChat")
 
 import argparse
@@ -12,7 +15,7 @@ import asyncio
 import json
 import os
 import uuid
-from threading import Thread
+from threading import Thread, current_thread
 from typing import List, Optional, Union
 
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -65,7 +68,7 @@ class LlamaModel():
                                                            token=TOKEN,
                                                            device=device)
 
-    def generate_iterate(self, prompt: str, max_generated_tokens, top_k, top_p,
+    def generate_iterate(self, queue, prompt: str, max_generated_tokens, top_k, top_p,
                          temperature):
         # Tokenize the user text.
         model_inputs = self.tokenizer(prompt, return_tensors="pt")
@@ -83,28 +86,25 @@ class LlamaModel():
                                temperature=float(temperature),
                                top_k=top_k,
                                eos_token_id=self.tokenizer.eos_token_id)
-        t = Thread(target=self.ov_model.generate, kwargs=generate_kwargs)
-        t.start()
 
+        self.ov_model.generate(**generate_kwargs)
         # Pull the generated text from the streamer, and update the model output.
         model_output = ""
         for new_text in streamer:
             model_output += new_text
-            yield model_output
-        return model_output
-
+            queue.put_nowait(model_output)
+        queue.put_nowait(None)
 
 class OpenvinoWorker(BaseModelWorker):
     def __init__(
-        self,
-        controller_addr: str,
-        worker_addr: str,
-        worker_id: str,
-        model_path: str,
-        model_names: List[str],
-        limit_worker_concurrency: int,
-        no_register: bool,
-        ov_model: LlamaModel
+            self,
+            controller_addr: str,
+            worker_addr: str,
+            worker_id: str,
+            model_path: str,
+            model_names: List[str],
+            limit_worker_concurrency: int,
+            no_register: bool,
     ):
         super().__init__(
             controller_addr,
@@ -123,6 +123,15 @@ class OpenvinoWorker(BaseModelWorker):
 
         if not no_register:
             self.init_heart_beat()
+
+    async def consumer(self, queue):
+        while True:
+            print("started consumer")
+            value = await queue.get()
+            print("consumed")
+            if value is None:
+                break
+            yield value
 
     async def generate_stream(self, params):
         self.call_ct += 1
@@ -152,28 +161,16 @@ class OpenvinoWorker(BaseModelWorker):
         if temperature <= 1e-5:
             top_p = 1.0
 
-        for output in ov_model.generate_iterate(build_inputs([("Hello","Hi!, How can I help you?")],context), max_new_tokens, 20, top_p, temperature):
+        queue = asyncio.Queue()
+        inputs = build_inputs([("Hello", "Hi!, How can I help you?")], context)
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None,ov_model.generate_iterate, queue, inputs,max_new_tokens, 20, top_p, temperature)
+
+        async for output in self.consumer(queue):
             yield {"text": output, "error_code": 0, "usage": {}}
-
-        # results_generator = engine.generate(context, sampling_params, request_id)
-
-        # async for request_output in results_generator:
-        #     prompt = request_output.prompt
-        #     if echo:
-        #         text_outputs = [
-        #             prompt + output.text for output in request_output.outputs
-        #         ]
-        #     else:
-        #         text_outputs = [output.text for output in request_output.outputs]
-        #     text_outputs = " ".join(text_outputs)
-        #     # Note: usage is not supported yet
-        #     ret = {"text": text_outputs, "error_code": 0, "usage": {}}
-        #     yield (json.dumps(ret) + "\0").encode()
-
     async def generate(self, params):
-        return {"text":"Fixed response", "error_code": 0, "usage": {}}
         async for x in self.generate_stream(params):
-            print(x)
+            pass
         return x
 
 
@@ -189,7 +186,7 @@ def acquire_worker_semaphore():
 
 def create_background_tasks(request_id):
     async def abort_request() -> None:
-        await engine.abort(request_id)
+        pass
 
     background_tasks = BackgroundTasks()
     background_tasks.add_task(release_worker_semaphore)
@@ -266,6 +263,7 @@ if __name__ == "__main__":
     ov_model = LlamaModel(args.model, model_path=args.model_path,
                               token=os.environ.get("HF_TOKEN", ""))
     print("*"*8+"MODEL LOADED!"+"*"*8)
+    executor = ThreadPoolExecutor(max_workers=1)
     worker = OpenvinoWorker(
         args.controller_address,
         args.worker_address,
@@ -274,6 +272,5 @@ if __name__ == "__main__":
         args.model_names,
         args.limit_worker_concurrency,
         args.no_register,
-        ov_model,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
