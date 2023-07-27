@@ -90,14 +90,12 @@ class LlamaModel():
                                top_k=top_k,
                                eos_token_id=self.tokenizer.eos_token_id)
 
-        print("Starting inference now...")
         executor = ThreadPoolExecutor(max_workers=1)
         executor.submit(self.ov_model.generate,**generate_kwargs)
         print("Producing streaming outputs...")
         # Pull the generated text from the streamer, and update the model output.
         model_output = ""
         for new_text in streamer:
-            print(f"Token: {new_text}")
             model_output += new_text
             queue.put_nowait(model_output)
         queue.put_nowait(None)
@@ -172,12 +170,17 @@ class OpenvinoWorker(BaseModelWorker):
         executor = ThreadPoolExecutor(max_workers=1)
         executor.submit(ov_model.generate_iterate, queue, context,max_new_tokens, 20, top_p, temperature)
 
-        async for output in self.consumer(queue):
-            yield {"text": output, "error_code": 0, "usage": {}}
+        resp = ""
+        async for token in self.consumer(queue):
+            ret = {"text": token, "error_code": 0, "usage": {}}
+            yield json.dumps(ret).encode() + b'\0'
+
     async def generate(self, params):
+        message = ""
         async for x in self.generate_stream(params):
-            pass
-        return x
+            ret = json.loads(x[:-1].decode())
+            message += ret['text']
+        return {"text": message, "error_code": 0, "usage": {}}
 
 
 def release_worker_semaphore():
